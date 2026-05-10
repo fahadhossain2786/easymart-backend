@@ -26,6 +26,7 @@ class User(AbstractUser):
     is_email_verified = models.BooleanField(default=False)
  
     username = models.CharField(max_length=150, unique=True)
+    vendor_code = models.CharField(max_length=20, unique=True, blank=True, null=True)
 
 USERNAME_FIELD = 'email'
 
