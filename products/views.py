@@ -1,11 +1,17 @@
 from django.db.models import Q
+from django.db.models import Sum, F
+from django.db import transaction
+from django.conf import settings
+from django.views.decorators.csrf import csrf_exempt
+import json
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-
-from .models import Product, Category ,Cart, CartItem,Order, OrderItem  
-from .serializers import ProductSerializer, CategorySerializer ,CartSerializer, CartItemSerializer,OrderSerializer, OrderItemSerializer
-
+from sslcommerz_lib import SSLCOMMERZ
+from .models import Commission, Product, Category, Cart, CartItem, Order, OrderItem, Payment, Notification
+from .serializers import ProductSerializer, CategorySerializer, CartSerializer, CartItemSerializer,OrderSerializer, OrderItemSerializer
+from users.models import User, Address
+from decimal import Decimal
 
 
 @api_view(['GET', 'POST'])
@@ -13,6 +19,7 @@ from .serializers import ProductSerializer, CategorySerializer ,CartSerializer, 
 def categories(request):
 
     # ---------------- GET (ONLY APPROVED) ----------------
+    
     if request.method == 'GET':
         cats = Category.objects.filter(is_approved=True)
         return Response(CategorySerializer(cats, many=True).data)
@@ -262,66 +269,70 @@ def remove_cart_item(request, item_id):
         "message": "Item removed"
     })
 
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def checkout(request):
 
-    try:
-        cart = Cart.objects.get(user=request.user)
-    except:
-        return Response({"error": "Cart empty"})
-
-    cart_items = cart.items.all()
+    cart_items = CartItem.objects.filter(cart__user=request.user)
 
     if not cart_items.exists():
-        return Response({"error": "Cart empty"})
+        return Response({"error": "Cart is empty"})
 
-    full_name = request.data.get('full_name')
-    phone = request.data.get('phone')
-    address = request.data.get('address')
-
-    if not full_name or not phone or not address:
-        return Response({"error": "All fields required"})
-
-    # ---------------- CREATE ORDER ----------------
-    order = Order.objects.create(
+    address = Address.objects.filter(
         user=request.user,
-        full_name=full_name,
-        phone=phone,
-        address=address
-    )
+        is_default=True
+    ).first()
 
-    total = 0
+    with transaction.atomic():
 
-    # ---------------- CREATE ORDER ITEMS ----------------
-    for item in cart_items:
-
-        product = item.product
-        subtotal = product.price * item.quantity
-
-        OrderItem.objects.create(
-            order=order,
-            product=product,
-            vendor=product.vendor,
-            quantity=item.quantity,
-            price=product.price
+        # ---------------- CREATE ORDER ----------------
+        order = Order.objects.create(
+            user=request.user,
+            full_name=address.full_name if address else request.user.full_name,
+            phone=address.phone if address else request.user.phone,
+            address=address.address if address else "No address",
+            status="pending",
+            total_price=0
         )
 
-        total += subtotal
+        total = 0
 
-    # save total
-    order.total_price = total
-    order.save()
+        # ---------------- CREATE ORDER ITEMS ----------------
+        for item in cart_items:
 
-    # ---------------- CLEAR CART ----------------
-    cart_items.delete()
+            # stock check (IMPORTANT IMPROVEMENT)
+            if item.product.stock < item.quantity:
+                raise Exception(f"Not enough stock for {item.product.name}")
+
+            subtotal = item.product.price * item.quantity
+            total += subtotal
+
+            OrderItem.objects.create(
+                order=order,
+                product=item.product,
+                vendor=item.product.vendor,
+                quantity=item.quantity,
+                price=item.product.price
+            )
+
+            # reduce stock
+            item.product.stock -= item.quantity
+            item.product.save()
+
+        # ---------------- FINAL UPDATE ----------------
+        order.total_price = total
+        order.save()
+
+        # ---------------- CLEAR CART ----------------
+        cart_items.delete()
 
     return Response({
-        "message": "Order placed successfully",
+        "message": "Checkout successful",
         "order_id": order.id,
-        "total_price": total
+        "total_price": total,
+        "next": "Create payment"
     })
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def my_orders(request):
@@ -336,3 +347,278 @@ def my_orders(request):
     )
 
     return Response(serializer.data)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_payment(request, order_id):
+
+    try:
+        order = Order.objects.get(id=order_id, user=request.user)
+    except:
+        return Response({"error": "Order not found"})
+
+    # ✅ use env/settings instead of hardcode
+    sslcz_settings = {
+        'store_id': settings.SSLC_STORE_ID,
+        'store_pass': settings.SSLC_STORE_PASSWORD,
+        'issandbox': settings.SSLC_SANDBOX
+    }
+
+    sslcz = SSLCOMMERZ(sslcz_settings)
+
+    data = {
+        'total_amount': float(order.total_price),
+        'currency': "BDT",
+        'tran_id': f"EZMART_{order.id}",
+
+        'success_url': "http://127.0.0.1:8000/api/payment/success/",
+        'fail_url': "http://127.0.0.1:8000/api/payment/fail/",
+        'cancel_url': "http://127.0.0.1:8000/api/payment/cancel/",
+
+        # ❗ FIXED: use user data, not order fields
+        'cus_name': request.user.full_name,
+        'cus_email': request.user.email,
+        'cus_phone': request.user.phone if hasattr(request.user, "phone") else "N/A",
+
+        'shipping_method': "NO",
+        'product_name': "EasyMart Order",
+        'product_category': "General",
+        'product_profile': "general"
+    }
+
+    response = sslcz.createSession(data)
+
+    return Response({
+        "payment_url": response['GatewayPageURL']
+    })
+from django.db import transaction
+from decimal import Decimal
+
+@csrf_exempt
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def payment_success(request):
+
+    tran_id = request.data.get("tran_id")
+
+    if not tran_id:
+        return Response({"error": "Transaction ID missing"})
+
+    try:
+        order_id = tran_id.split("_")[1]
+        order = Order.objects.get(id=order_id)
+    except:
+        return Response({"error": "Order not found"})
+
+    # 🚨 Prevent duplicate payment
+    if Payment.objects.filter(order=order).exists():
+        return Response({"message": "Already paid"})
+
+    # 🔒 TRANSACTION SAFETY START
+    with transaction.atomic():
+
+        # 1. Create Payment
+        Payment.objects.create(
+            order=order,
+            amount=order.total_price,
+            status="success",
+            transaction_id=tran_id,
+            method="sslcommerz"
+        )
+
+        # 2. Update Order
+        order.status = "paid"
+        order.save()
+
+        # 3. Commission calculation
+        total = order.total_price
+        platform_fee = total * Decimal("0.10")
+        vendor_amount = total - platform_fee
+
+        Commission.objects.create(
+            order=order,
+            amount=total,
+            platform_fee=platform_fee,
+            vendor_amount=vendor_amount
+        )
+
+        # 4. Notification
+        Notification.objects.create(
+            user=order.user,
+            title="Payment Successful",
+            message=f"Your payment for Order #{order.id} was successful."
+        )
+
+    # 🔒 TRANSACTION END
+
+    return Response({
+        "message": "Payment successful",
+        "order_id": order.id,
+        "status": order.status
+    })
+
+@csrf_exempt
+@api_view(['POST'])
+def payment_fail(request):
+
+    tran_id = request.data.get("tran_id")
+
+    if tran_id:
+        try:
+            order_id = tran_id.split("_")[1]
+            order = Order.objects.get(id=order_id)
+
+            order.status = "failed"
+            order.save()
+
+        except:
+            pass
+
+    return Response({
+        "message": "Payment failed"
+    })
+@csrf_exempt
+@api_view(['POST'])
+def payment_cancel(request):
+
+    tran_id = request.data.get("tran_id")
+
+    if tran_id:
+        try:
+            order_id = tran_id.split("_")[1]
+            order = Order.objects.get(id=order_id)
+
+            order.status = "cancelled"
+            order.save()
+
+        except:
+            pass
+
+    return Response({
+        "message": "Payment cancelled"
+    })
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def vendor_dashboard(request):
+
+    if request.user.role != 'vendor':
+        return Response({"error": "Only vendors allowed"})
+
+    products = Product.objects.filter(vendor=request.user)
+
+    total_products = products.count()
+
+    approved_products = products.filter(
+        is_approved=True
+    ).count()
+
+    pending_products = products.filter(
+        is_approved=False
+    ).count()
+
+    order_items = OrderItem.objects.filter(
+        product__vendor=request.user,
+        order__status='paid'
+    )
+
+    total_orders = order_items.values(
+        'order'
+    ).distinct().count()
+
+    total_sales = order_items.aggregate(
+        total=Sum(F('price') * F('quantity'))
+    )['total'] or 0
+
+    vendor_commission = total_sales * Decimal("0.90")
+
+    return Response({
+
+        "products": {
+            "total": total_products,
+            "approved": approved_products,
+            "pending": pending_products
+        },
+
+        "orders": {
+            "total_orders": total_orders
+        },
+
+        "earnings": {
+            "gross_sales": total_sales,
+            "vendor_income": vendor_commission
+        }
+    })
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def vendor_orders(request):
+
+    if request.user.role != 'vendor':
+        return Response({"error": "Only vendors allowed"})
+
+    items = OrderItem.objects.filter(product__vendor=request.user)
+
+    data = []
+
+    for item in items:
+        data.append({
+            "order_id": item.order.id,
+            "product": item.product.name,
+            "quantity": item.quantity,
+            "price": item.price,
+            "customer": item.order.user.email,
+            "status": item.order.status
+        })
+
+    return Response(data)
+
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def addresses(request):
+
+    # ---------------- GET ----------------
+    if request.method == 'GET':
+
+        data = Address.objects.filter(user=request.user).order_by('-id')
+
+        return Response([
+            {
+                "id": a.id,
+                "full_name": a.full_name,
+                "phone": a.phone,
+                "address": a.address,
+                "city": a.city,
+                "postal_code": a.postal_code,
+                "is_default": a.is_default
+            }
+            for a in data
+        ])
+
+    # ---------------- POST (CREATE) ----------------
+    data = request.data
+
+    # validation
+    if not data.get("full_name") or not data.get("phone") or not data.get("address"):
+        return Response({
+            "error": "full_name, phone and address are required"
+        })
+
+    # OPTIONAL: only one default address
+    if data.get("is_default", False):
+        Address.objects.filter(user=request.user, is_default=True).update(is_default=False)
+
+    address = Address.objects.create(
+        user=request.user,
+        full_name=data.get("full_name"),
+        phone=data.get("phone"),
+        address=data.get("address"),
+        city=data.get("city", ""),
+        postal_code=data.get("postal_code", ""),
+        is_default=data.get("is_default", False)
+    )
+
+    return Response({
+        "message": "Address added successfully",
+        "id": address.id
+    })

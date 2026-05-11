@@ -17,7 +17,11 @@ from django.urls import reverse
 from django.utils.http import urlsafe_base64_encode
 from django.utils.encoding import force_bytes
 from django.contrib.auth.tokens import default_token_generator
+import os
+from dotenv import load_dotenv
 
+
+load_dotenv()
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -75,6 +79,10 @@ TEMPLATES = [
         },
     },
 ]
+
+SSLC_STORE_ID = os.getenv("SSLC_STORE_ID")
+SSLC_STORE_PASSWORD = os.getenv("SSLC_STORE_PASSWORD")
+SSLC_SANDBOX = os.getenv("SSLC_SANDBOX", True)
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
