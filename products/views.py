@@ -3,8 +3,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Product, Category
-from .serializers import ProductSerializer, CategorySerializer
+from .models import Product, Category ,Cart, CartItem,Order, OrderItem  
+from .serializers import ProductSerializer, CategorySerializer ,CartSerializer, CartItemSerializer,OrderSerializer, OrderItemSerializer
 
 
 
@@ -175,3 +175,164 @@ def reject_product(request, pk):
     Product.objects.get(pk=pk).delete()
 
     return Response({"message": "Product rejected"})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def add_to_cart(request, product_id):
+
+    try:
+        product = Product.objects.get(
+            id=product_id,
+            is_approved=True
+        )
+    except:
+        return Response({"error": "Product not found"})
+
+    cart, created = Cart.objects.get_or_create(
+        user=request.user
+    )
+
+    cart_item, created = CartItem.objects.get_or_create(
+        cart=cart,
+        product=product
+    )
+
+    if not created:
+        cart_item.quantity += 1
+
+    cart_item.save()
+
+    return Response({
+        "message": "Added to cart"
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def view_cart(request):
+
+    cart, created = Cart.objects.get_or_create(
+        user=request.user
+    )
+
+    serializer = CartSerializer(cart)
+
+    return Response(serializer.data)
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def update_cart_item(request, item_id):
+
+    try:
+        item = CartItem.objects.get(
+            id=item_id,
+            cart__user=request.user
+        )
+    except:
+        return Response({"error": "Item not found"})
+
+    quantity = request.data.get('quantity')
+
+    if not quantity or int(quantity) < 1:
+        return Response({"error": "Invalid quantity"})
+
+    item.quantity = quantity
+    item.save()
+
+    return Response({
+        "message": "Cart updated"
+    })
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def remove_cart_item(request, item_id):
+
+    try:
+        item = CartItem.objects.get(
+            id=item_id,
+            cart__user=request.user
+        )
+    except:
+        return Response({"error": "Item not found"})
+
+    item.delete()
+
+    return Response({
+        "message": "Item removed"
+    })
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def checkout(request):
+
+    try:
+        cart = Cart.objects.get(user=request.user)
+    except:
+        return Response({"error": "Cart empty"})
+
+    cart_items = cart.items.all()
+
+    if not cart_items.exists():
+        return Response({"error": "Cart empty"})
+
+    full_name = request.data.get('full_name')
+    phone = request.data.get('phone')
+    address = request.data.get('address')
+
+    if not full_name or not phone or not address:
+        return Response({"error": "All fields required"})
+
+    # ---------------- CREATE ORDER ----------------
+    order = Order.objects.create(
+        user=request.user,
+        full_name=full_name,
+        phone=phone,
+        address=address
+    )
+
+    total = 0
+
+    # ---------------- CREATE ORDER ITEMS ----------------
+    for item in cart_items:
+
+        product = item.product
+        subtotal = product.price * item.quantity
+
+        OrderItem.objects.create(
+            order=order,
+            product=product,
+            vendor=product.vendor,
+            quantity=item.quantity,
+            price=product.price
+        )
+
+        total += subtotal
+
+    # save total
+    order.total_price = total
+    order.save()
+
+    # ---------------- CLEAR CART ----------------
+    cart_items.delete()
+
+    return Response({
+        "message": "Order placed successfully",
+        "order_id": order.id,
+        "total_price": total
+    })
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def my_orders(request):
+
+    orders = Order.objects.filter(
+        user=request.user
+    ).order_by('-id')
+
+    serializer = OrderSerializer(
+        orders,
+        many=True
+    )
+
+    return Response(serializer.data)
